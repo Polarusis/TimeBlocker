@@ -9,11 +9,80 @@ from pathlib import Path
 from datetime import date
 import csv
 import io
+import os
+import sys
+import shutil
+import importlib
+import ctypes
+import winreg
+# ============================================================
+# АВТОМАТИЧНЕ ВСТАНОВЛЕННЯ ЗАЛЕЖНОСТЕЙ
+# ============================================================
+
+def ensure_package(package, import_name):
+
+    try:
+        importlib.import_module(import_name)
+        return True
+
+    except ImportError:
+
+        try:
+
+            subprocess.check_call([
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--user",
+                package
+            ])
+
+            return True
+
+        except Exception as e:
+
+            messagebox.showerror(
+                "Помилка встановлення",
+                f"Не вдалося встановити {package}.\n\n"
+                f"Помилка:\n{e}"
+            )
+
+            return False
 
 
-DATA_FILE = Path(__file__).with_name("limits.json")
+if not ensure_package("pystray", "pystray"):
+    sys.exit()
+
+if not ensure_package("Pillow", "PIL"):
+    sys.exit()
+
+import pystray
+
+from PIL import Image, ImageDraw
+
+# ============================================================
+# ЗАБОРОНА ЗАПУСКУ ДРУГОЇ КОПІЇ
+# ============================================================
+
+MUTEX_NAME = "EXE_Time_Blocker_Single_Instance"
+
+mutex = ctypes.windll.kernel32.CreateMutexW(
+    None,
+    False,
+    MUTEX_NAME
+)
+
+if ctypes.windll.kernel32.GetLastError() == 183:
+    # Програма вже запущена
+    sys.exit(0)
+
+if getattr(sys, "frozen", False):
+    DATA_FILE = Path(sys.executable).resolve().parent / "limits.json"
+else:
+    DATA_FILE = Path(__file__).resolve().parent / "limits.json"
+
 CHECK_INTERVAL = 0.5
-
 
 # ============================================================
 # ЗАВАНТАЖЕННЯ НАЛАШТУВАНЬ
@@ -43,7 +112,6 @@ def load_data():
             # ------------------------------------------------
 
             if data.get("date") != str(date.today()):
-
                 for block in data.get("blocks", {}).values():
 
                     block["used"] = 0
@@ -89,11 +157,176 @@ def save_data():
 
     save_data_direct(data)
 
+def check_new_day():
+
+    today = str(date.today())
+
+    if data.get("date") != today:
+
+        data["date"] = today
+
+        for block in data.get("blocks", {}).values():
+            block["used"] = 0
+
+        save_data()
+
+        return True
+
+    return False
 
 data = load_data()
 
 running = True
 
+# ============================================================
+# РЕЖИМ ЗАПУСКУ
+# ============================================================
+
+START_IN_BACKGROUND = "--background" in sys.argv
+
+# ============================================================
+# АВТОЗАПУСК WINDOWS
+# ============================================================
+
+APP_NAME = "EXE Time Blocker"
+
+
+def get_startup_folder():
+
+    return Path(
+        os.environ["APPDATA"]
+    ) / (
+        r"Microsoft\Windows\Start Menu\Programs\Startup"
+    )
+
+
+def get_exe_path():
+
+    if getattr(sys, "frozen", False):
+
+        return Path(sys.executable).resolve()
+
+    return Path(__file__).resolve()
+
+
+def enable_autostart():
+    try:
+        source = get_exe_path()
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE
+        )
+
+        winreg.SetValueEx(
+            key,
+            APP_NAME,
+            0,
+            winreg.REG_SZ,
+            f'"{source}" --background'
+        )
+
+        winreg.CloseKey(key)
+
+        # Видаляємо старі способи автозапуску
+        startup = get_startup_folder()
+
+        for old_file in [
+            startup / f"{APP_NAME}.bat",
+            startup / f"{APP_NAME}.vbs",
+            startup / f"{APP_NAME}.lnk"
+        ]:
+            if old_file.exists():
+                old_file.unlink()
+
+        return True
+
+    except Exception as e:
+        print("Помилка автозапуску:", e)
+        return False
+
+def disable_autostart():
+
+    try:
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE
+        )
+
+        try:
+
+            winreg.DeleteValue(
+                key,
+                APP_NAME
+            )
+
+        except FileNotFoundError:
+
+            pass
+
+        winreg.CloseKey(key)
+
+        # Видаляємо старі способи автозапуску
+        startup = get_startup_folder()
+
+        for old_file in [
+            startup / f"{APP_NAME}.bat",
+            startup / f"{APP_NAME}.vbs",
+            startup / f"{APP_NAME}.lnk"
+        ]:
+
+            if old_file.exists():
+
+                old_file.unlink()
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "Помилка вимкнення автозапуску:",
+            e
+        )
+
+        return False
+
+
+def autostart_enabled():
+
+    try:
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_READ
+        )
+
+        try:
+
+            value, _ = winreg.QueryValueEx(
+                key,
+                APP_NAME
+            )
+
+            winreg.CloseKey(key)
+
+            return bool(value)
+
+        except FileNotFoundError:
+
+            winreg.CloseKey(key)
+
+            return False
+
+    except Exception:
+
+        return False
 
 # ============================================================
 # РОБОТА З ЧАСОМ
@@ -118,9 +351,14 @@ def format_time(seconds):
 # ОТРИМАННЯ ЗАПУЩЕНИХ EXE
 # ============================================================
 
-def is_process_running(exe_name):
+import csv
+import io
+
+
+def get_process_names():
 
     try:
+
         result = subprocess.run(
             [
                 "tasklist",
@@ -130,29 +368,28 @@ def is_process_running(exe_name):
             ],
             capture_output=True,
             text=True,
-            encoding="cp1250",
-            errors="ignore",
             creationflags=subprocess.CREATE_NO_WINDOW
         )
 
-        reader = csv.reader(io.StringIO(result.stdout))
+        processes = set()
 
-        target = exe_name.strip().lower()
+        reader = csv.reader(
+            io.StringIO(result.stdout)
+        )
 
         for row in reader:
 
-            if not row:
-                continue
+            if row:
 
-            process_name = row[0].strip().lower()
+                processes.add(
+                    row[0].strip().lower()
+                )
 
-            if process_name == target:
-                return True
-
-        return False
+        return processes
 
     except Exception:
-        return False
+
+        return set()
 # ============================================================
 # ПРИМУСОВЕ ЗАКРИТТЯ EXE
 # ============================================================
@@ -193,6 +430,121 @@ root.minsize(
     450
 )
 
+# ============================================================
+# СИСТЕМНИЙ ТРЕЙ
+# ============================================================
+
+tray_icon = None
+
+
+def create_tray_image():
+
+    image = Image.new(
+        "RGB",
+        (64, 64),
+        "white"
+    )
+
+    draw = ImageDraw.Draw(image)
+
+    draw.rectangle(
+        (8, 8, 56, 56),
+        outline="black",
+        width=4
+    )
+
+    draw.line(
+        (32, 16, 32, 32),
+        fill="black",
+        width=4
+    )
+
+    draw.line(
+        (32, 32, 44, 38),
+        fill="black",
+        width=4
+    )
+
+    return image
+
+
+def show_window(icon=None, item=None):
+
+    root.after(
+        0,
+        lambda: (
+            root.deiconify(),
+            root.lift(),
+            root.focus_force()
+        )
+    )
+
+
+def hide_window():
+
+    root.withdraw()
+
+
+def exit_application(icon=None, item=None):
+
+    global running
+
+    running = False
+
+    try:
+        if icon:
+            icon.stop()
+    except Exception:
+        pass
+
+    save_data()
+
+    root.after(
+        0,
+        root.destroy
+    )
+
+
+def toggle_autostart(icon=None, item=None):
+
+    if autostart_enabled():
+        disable_autostart()
+    else:
+        enable_autostart()
+
+
+def start_tray():
+
+    global tray_icon
+
+    menu = pystray.Menu(
+
+        pystray.MenuItem(
+            "Відкрити",
+            show_window,
+            default=True
+        ),
+
+        pystray.MenuItem(
+            "Автозапуск Windows",
+            toggle_autostart,
+            checked=lambda item: autostart_enabled()
+        ),
+
+        pystray.MenuItem(
+            "Вийти",
+            exit_application
+        )
+    )
+
+    tray_icon = pystray.Icon(
+        APP_NAME,
+        create_tray_image(),
+        APP_NAME,
+        menu
+    )
+
+    tray_icon.run()
 
 # ============================================================
 # СТИЛЬ
@@ -1028,22 +1380,33 @@ def monitor():
 
     while running:
 
+        # Перевірка нового дня
+        today = str(date.today())
+
+        if data.get("date") != today:
+
+            data["date"] = today
+
+            for block in data.get("blocks", {}).values():
+                block["used"] = 0
+
+            save_data()
+
+            root.after(0, refresh)
+
         now = time.monotonic()
 
-        delta = min(
-            now - last_check,
-            2.0
-        )
-
+        delta = min(now - last_check, 2.0)
         last_check = now
 
+        running_processes = get_process_names()
+
+        changed = False
 
         for block_name, block in list(data["blocks"].items()):
 
             programs = block.get("programs", [])
-
             limit = block.get("limit", 0)
-
             used = block.get("used", 0)
 
 
@@ -1055,7 +1418,7 @@ def monitor():
 
             for exe in programs:
 
-                if is_process_running(exe):
+                if exe.lower() in running_processes:
                     active_programs.append(exe)
 
 
@@ -1118,16 +1481,10 @@ def monitor():
 
 def on_close():
 
-    global running
+    # Хрестик лише ховає програму у трей.
+    # Сам монітор продовжує працювати.
 
-    running = False
-
-
-    save_data()
-
-
-    root.destroy()
-
+    root.withdraw()
 
 root.protocol(
     "WM_DELETE_WINDOW",
@@ -1150,6 +1507,42 @@ threading.Thread(
     target=monitor,
     daemon=True
 ).start()
+
+# ============================================================
+# АВТОЗАПУСК
+# ============================================================
+
+# Увімкнути автозапуск автоматично при першому запуску
+if not autostart_enabled():
+
+    enable_autostart()
+
+
+# ============================================================
+# ЗАПУСК ТРЕЮ
+# ============================================================
+
+threading.Thread(
+    target=start_tray,
+    daemon=True
+).start()
+
+
+# ============================================================
+# ПОКАЗ ВІКНА
+# ============================================================
+
+if START_IN_BACKGROUND:
+
+    # Автозапуск Windows → працюємо приховано
+
+    root.withdraw()
+
+else:
+
+    # Звичайний запуск → показуємо GUI
+
+    root.deiconify()
 
 
 # ============================================================
